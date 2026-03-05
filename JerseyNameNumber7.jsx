@@ -411,7 +411,7 @@ function getCapBaseline(layer, text, fontSize, groupVB) {
 // ────────────────────────────────────────────────────────
 //  CORE: Stroked outlined text (1, 2, or 3 layers)
 // ────────────────────────────────────────────────────────
-function makeStrokedText(doc, layer, text, fontSize, style, posX, posY) {
+function makeStrokedText(layer, text, fontSize, style, posX, posY) {
     var iw = Math.round(fontSize * style.innerPct);
     var ow = Math.round(fontSize * style.outerPct);
 
@@ -632,10 +632,10 @@ function buildBackUnit(doc, layer, baseX, baseY, name, number, targetH, logoPath
     var zones = CFG._backZones || null;
 
     // Create text groups
-    var numGroup = makeStrokedText(doc, layer, number, numPts, CFG.number, baseX, baseY);
+    var numGroup = makeStrokedText(layer, number, numPts, CFG.number, baseX, baseY);
     var nameGroup = null;
     if (name && name !== "") {
-        nameGroup = makeStrokedText(doc, layer, name, namePts, CFG.name, baseX, baseY);
+        nameGroup = makeStrokedText(layer, name, namePts, CFG.name, baseX, baseY);
 
         // Relative gap positioning only when NOT using guide zones
         if (!zones) {
@@ -872,10 +872,10 @@ function generatePlayer(doc, printLayer, templateLayer, abIndex, player) {
     // ══════════════════════════════════════════
     //  DEFAULT MODE (no jersey template)
     // ══════════════════════════════════════════
-    var numGroup = makeStrokedText(doc, printLayer, number, numPts, CFG.number, baseX, baseY);
+    var numGroup = makeStrokedText(printLayer, number, numPts, CFG.number, baseX, baseY);
     var nameGroup = null;
     if (name && name !== "") {
-        nameGroup = makeStrokedText(doc, printLayer, name, namePts, CFG.name, baseX, baseY);
+        nameGroup = makeStrokedText(printLayer, name, namePts, CFG.name, baseX, baseY);
         var nv2 = numGroup.visibleBounds;
         var av2 = nameGroup.visibleBounds;
         var capBaseline2 = getCapBaseline(printLayer, name, namePts, av2);
@@ -893,12 +893,15 @@ function generatePlayer(doc, printLayer, templateLayer, abIndex, player) {
     // Logo placement (default mode)
     addLogoToGroup(printLayer, playerLogoPath, numGroup, nameGroup, textOnlyGroup);
 
-    // Center text BEFORE adding bgRect (bgRect fills artboard and would
-    // make group bounds equal artboard bounds, defeating centering)
+    // Center text BEFORE adding bgRect.
+    // bgRect fills the full artboard; including it in the group used for
+    // scaling/centering would make group bounds == artboard bounds, which
+    // defeats both operations.  Instead: scale/center text first, then
+    // add a full-artboard bgRect behind it.
     if (CFG.outputMode === "proof") {
-        // Proof: wrap with bgRect then scale everything together
-        var g = printLayer.groupItems.add();
-        textOnlyGroup.move(g, ElementPlacement.PLACEATEND);
+        // Proof: scale text to fit usable area, then place artboard-filling bg behind it.
+        scaleToFitArtboard(doc, abIndex, textOnlyGroup);
+        // Background stays full-artboard — created AFTER text is positioned
         var bgRect = printLayer.pathItems.rectangle(
             abRect[1], abRect[0],
             abRect[2] - abRect[0], abRect[1] - abRect[3]
@@ -906,8 +909,10 @@ function generatePlayer(doc, printLayer, templateLayer, abIndex, player) {
         bgRect.fillColor = cmyk(CFG.bgColor);
         bgRect.filled = true;
         bgRect.stroked = false;
-        bgRect.move(g, ElementPlacement.PLACEATEND);
-        scaleToFitArtboard(doc, abIndex, g);
+        // Group with text in front, background behind
+        var g = printLayer.groupItems.add();
+        textOnlyGroup.move(g, ElementPlacement.PLACEATBEGINNING); // text on top
+        bgRect.move(g, ElementPlacement.PLACEATEND);              // bg behind
     } else {
         // Production: center text first, then place bgRect behind
         centerGroupInArtboard(doc, abIndex, textOnlyGroup);
@@ -996,6 +1001,7 @@ function isRasterFile(filePath) {
 // Import a jersey template (raster or vector), scale to target height, return item (or null)
 // Tags the imported item as "__jersey_template__" for later layer separation.
 function importJerseyTemplate(layer, templatePath, targetHeight) {
+    if (!templatePath) return null;  // guard: no template configured
     var templateFile = new File(templatePath);
     if (!templateFile.exists) return null;
 
@@ -1048,13 +1054,16 @@ function importJerseyTemplate(layer, templatePath, targetHeight) {
     return item;
 }
 
-// Read SVG viewBox without importing (for pre-calculation)
+// Read SVG viewBox without importing (for pre-calculation).
+// Scans up to 100 lines so it works even when the <svg> tag is not
+// at the very top of the file (e.g. after XML declarations or DOCTYPE).
 function readSVGViewBox(svgPath) {
+    if (!svgPath) return null;
     var f = new File(svgPath);
     if (!f.exists) return null;
     f.open("r");
     var head = "";
-    for (var li = 0; li < 15 && !f.eof; li++) head += f.readln();
+    for (var li = 0; li < 100 && !f.eof; li++) head += f.readln();
     f.close();
     var m = head.match(/viewBox\s*=\s*"([^"]+)"/);
     if (!m) return null;
@@ -1262,6 +1271,73 @@ function addLogoToGroup(layer, logoPath, numGroup, nameGroup, textGroup) {
 // ────────────────────────────────────────────────────────
 //  CSV PARSER  (header-aware: Name,Number,Size,Model,TeamName)
 // ────────────────────────────────────────────────────────
+
+/**
+ * Quote-safe CSV line parser (RFC 4180 + common extensions).
+ * Handles: commas inside quoted fields ("SMITH, JR"),
+ *          doubled-quote escapes inside quoted fields ("O""CONNOR"),
+ *          optional whitespace (spaces/tabs) around unquoted values, and
+ *          empty fields (including a trailing comma producing a final empty field).
+ * Returns an array of field strings (leading/trailing whitespace trimmed
+ * for unquoted fields; inner content preserved as-is for quoted fields).
+ */
+function parseCSVLine(line) {
+    var fields = [];
+    var i = 0;
+    var len = line.length;
+
+    if (len === 0) return fields;
+
+    while (true) {
+        // Skip optional leading whitespace (space or tab) before each field
+        while (i < len && (line.charAt(i) === ' ' || line.charAt(i) === '\t')) i++;
+
+        if (i < len && line.charAt(i) === '"') {
+            // ── Quoted field ──
+            i++; // skip opening quote
+            var field = "";
+            while (i < len) {
+                var ch = line.charAt(i);
+                if (ch === '"') {
+                    if (i + 1 < len && line.charAt(i + 1) === '"') {
+                        // Doubled quote is an escaped literal quote
+                        field += '"';
+                        i += 2;
+                    } else {
+                        i++; // skip closing quote
+                        break;
+                    }
+                } else {
+                    field += ch;
+                    i++;
+                }
+            }
+            fields.push(field);
+            // Skip optional trailing whitespace (space or tab) after closing quote
+            while (i < len && (line.charAt(i) === ' ' || line.charAt(i) === '\t')) i++;
+        } else {
+            // ── Unquoted field: read until comma or end of line ──
+            var start = i;
+            while (i < len && line.charAt(i) !== ',') i++;
+            fields.push(trim(line.substring(start, i)));
+        }
+
+        // Consume comma separator; if none, we're done
+        if (i < len && line.charAt(i) === ',') {
+            i++;
+            if (i === len) {
+                // Trailing comma → append empty last field and stop
+                fields.push("");
+                break;
+            }
+            // Continue to next field
+        } else {
+            break; // end of line (no more commas)
+        }
+    }
+    return fields;
+}
+
 function parseCSV(file) {
     var players = [];
     file.open("r");
@@ -1273,12 +1349,10 @@ function parseCSV(file) {
         lineNum++;
         line = trim(line);
         if (line === "") continue;
-        var cols = line.split(",");
+        var cols = parseCSVLine(line);
         if (cols.length < 2) continue;
 
-        // Clean each column value
-        for (var ci = 0; ci < cols.length; ci++)
-            cols[ci] = trim(cols[ci]).replace(/^"|"$/g, "");
+        // Note: quoted fields are already stripped of enclosing quotes by parseCSVLine.
 
         // First row: detect headers
         if (lineNum === 1) {
@@ -1354,20 +1428,20 @@ function parsePresetsCSV(file) {
         // Skip header row
         if (lineNum === 1 && /^Team/i.test(line)) continue;
 
-        // Split on comma but respect quoted values
-        var cols = line.split(",");
+        // Use quote-safe parser so team names like "Seattle, WA" parse correctly
+        var cols = parseCSVLine(line);
         if (cols.length < 4) continue;
 
-        var team    = trim(cols[0]).replace(/^"|"$/g, "");
-        var variant = trim(cols[1]).replace(/^"|"$/g, "");
-        var layers  = parseInt(trim(cols[2])) || 2;
-        var fillHex = trim(cols[3]).replace(/^"|"$/g, "");
+        var team    = cols[0];
+        var variant = cols[1];
+        var layers  = parseInt(cols[2]) || 2;
+        var fillHex = cols[3];
         // cols[4] = Fill_Name (skip)
-        var innerHex = (cols.length > 5) ? trim(cols[5]).replace(/^"|"$/g, "") : "";
+        var innerHex = (cols.length > 5) ? cols[5] : "";
         // cols[6] = Inner_Name (skip)
-        var outerHex = (cols.length > 7) ? trim(cols[7]).replace(/^"|"$/g, "") : "";
+        var outerHex = (cols.length > 7) ? cols[7] : "";
         // cols[8] = Outer_Name (skip)
-        var bgHex    = (cols.length > 9) ? trim(cols[9]).replace(/^"|"$/g, "") : "";
+        var bgHex    = (cols.length > 9) ? cols[9] : "";
         // cols[10] = Notes (skip)
 
         if (team === "" || fillHex === "") continue;
